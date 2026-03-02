@@ -22,3 +22,13 @@ jobs:
 
       - name: Invalidate CDN cache
         run: gcloud compute url-maps invalidate-cdn-cache ${{ secrets.CDN_URL_MAP }} --path "/*"
+
+  notify:
+    needs: frontend
+    if: always()
+    uses: ./.github/workflows/discord-deploy-notify.yml
+    with:
+      status: ${{ needs.frontend.result }}
+      service: API Frontend
+    secrets:
+      DISCORD_DEPLOY_WEBHOOK: ${{ secrets.DISCORD_DEPLOY_WEBHOOK }}
