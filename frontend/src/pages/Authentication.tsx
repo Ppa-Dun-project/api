@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { GoogleLogin } from "@react-oauth/google";
 import type { CredentialResponse } from "@react-oauth/google";
 
@@ -16,11 +16,27 @@ interface User {
 }
 
 function Authentication() {
-  const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string>("");
+  const [user, setUser] = useState<User | null>(() => {
+    const saved = sessionStorage.getItem("user");
+    return saved ? JSON.parse(saved) : null;
+  });
+  const [token, setToken] = useState<string>(() => {
+    return sessionStorage.getItem("token") || "";
+  });
   const [apiKeys, setApiKeys] = useState<APIKey[]>([]);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (user && token) {
+      sessionStorage.setItem("user", JSON.stringify(user));
+      sessionStorage.setItem("token", token);
+      fetchApiKeys(token);
+    } else {
+      sessionStorage.removeItem("user");
+      sessionStorage.removeItem("token");
+    }
+  }, [user, token]);
 
   const handleLogin = async (response: CredentialResponse) => {
     if (!response.credential) return;
