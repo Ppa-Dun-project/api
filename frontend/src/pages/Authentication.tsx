@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { GoogleLogin, CredentialResponse } from "@react-oauth/google";
+import { GoogleLogin } from "@react-oauth/google";
+import type { CredentialResponse } from "@react-oauth/google";
 
 const API_URL = import.meta.env.VITE_API_URL || "";
 
