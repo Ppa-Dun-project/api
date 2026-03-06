@@ -8,7 +8,7 @@ on:
 
 env:
   GCP_ZONE: us-east1-b
-  IMAGE: us-east1-docker.pkg.dev/v1-mvp/api/backend
+  IMAGE: us-east1-docker.pkg.dev/v1-mvp/be-api/backend
 
 jobs:
   build-and-push:
