@@ -1,149 +1,254 @@
-import statistics
-from fastapi import HTTPException
-from api.models.player import PlayerValueResponse, PlayerBidResponse, PlayerBidRequest
-from api.data.mock_players import MOCK_PLAYER_POOL
+from api.models.player import (
+    PlayerValueRequest,
+    PlayerBidRequest,
+    PlayerValueResponse,
+    PlayerBidResponse,
+    ValueBreakdown,
+    BidBreakdown,
+    BatterStats,
+    PitcherStats,
+)
 
-# ── Constants ───────────────────────────────────────────
-NUM_TEAMS = 12
-BUDGET_PER_TEAM = 260
-HITTER_SPLIT = 0.635        # Portion of total budget allocated to hitters
-ROSTER_SPOTS = 14           # Hitter roster slots per team
-MIN_AB = 150                # Players below this AB threshold are excluded from pool
-REPLACEMENT_N = NUM_TEAMS * 2  # Replacement level = Nth best player in pool
+# ── League Baseline Constants (Roto 5x5 standard) ───────────────────────────
+# These values represent average and standard deviation of stats
+# across a typical 12-team Roto 5x5 fantasy-relevant player pool.
+# Source: derived from historical MLB fantasy league data.
 
-# ── Helper: filter player pool ──────────────────────────
-def _get_pool() -> list[dict]:
-    """Return only players with AB >= MIN_AB"""
-    return [p for p in MOCK_PLAYER_POOL if p["AB"] >= MIN_AB]
+BATTER_BASELINES = {
+    "R":   {"mean": 75.0,  "std": 20.0},
+    "HR":  {"mean": 18.0,  "std": 10.0},
+    "RBI": {"mean": 72.0,  "std": 20.0},
+    "SB":  {"mean": 12.0,  "std": 10.0},
+    "AVG": {"mean": 0.260, "std": 0.025},
+}
 
-# ── Helper: z-score ─────────────────────────────────────
+PITCHER_BASELINES = {
+    "W":    {"mean": 10.0,  "std": 4.0},
+    "SV":   {"mean": 10.0,  "std": 14.0},
+    "K":    {"mean": 130.0, "std": 50.0},
+    "ERA":  {"mean": 4.00,  "std": 0.70},
+    "WHIP": {"mean": 1.25,  "std": 0.15},
+}
+
+# Maximum theoretical raw z-score sum for normalization
+# Set to the approximate z_total of an all-time elite player
+Z_MAX_BATTER  = 10.0
+Z_MAX_PITCHER = 10.0
+RAW_MAX       = 12.0   # z_total + max possible position_bonus
+
+# Hitter/pitcher budget split (standard Roto 5x5 convention)
+HIT_PITCH_RATIO = {
+    "batter":  0.67,
+    "pitcher": 0.33,
+}
+
+# Positional scarcity bonus (in z-score units)
+POSITION_BONUS = {
+    "C":  1.5,
+    "SS": 0.8,
+    "RP": 0.6,
+    "CL": 0.6,
+    "SP": 0.4,
+    "2B": 0.5,
+    "3B": 0.3,
+    "1B": 0.0,
+    "OF": 0.0,
+    "DH": 0.0,
+}
+
+# Positional scarcity multiplier for bid calculation
+SCARCITY_MULTIPLIER = {
+    "C":  1.15,
+    "SS": 1.08,
+    "2B": 1.05,
+    "SP": 1.05,
+    "RP": 1.05,
+    "CL": 1.05,
+    "3B": 1.02,
+    "1B": 1.00,
+    "OF": 1.00,
+    "DH": 1.00,
+}
+
+
+# ── Internal Helpers ─────────────────────────────────────────────────────────
+
 def _zscore(value: float, mean: float, std: float) -> float:
-    """Returns 0 if std is 0 to prevent division by zero"""
+    """Compute z-score. Returns 0.0 if std is 0 to prevent division by zero."""
     if std == 0:
         return 0.0
     return (value - mean) / std
 
-# ── Helper: weighted z-score for AVG ────────────────────
-def _avg_zscore(player: dict, pool: list[dict]) -> float:
+
+def _normalize(value: float, max_val: float) -> float:
+    """Scale value to [0.0, 100.0] range, clipped at boundaries."""
+    if max_val == 0:
+        return 0.0
+    scaled = (value / max_val) * 100.0
+    return max(0.0, min(100.0, scaled))
+
+
+def _compute_z_scores(stats: BatterStats | PitcherStats, player_type: str) -> float:
     """
-    AVG is a rate stat and cannot be z-scored directly.
-    Measures: 'how much does this player shift the team AVG
-    when added to an average team?'
-
-    team_avg_with_player = (team_H + player_H) / (team_AB + player_AB)
-    delta = team_avg_with_player - baseline_team_avg
-    z_AVG = delta / std_dev(deltas across all players)
+    Compute total z-score across all 5 Roto categories.
+    For pitchers, ERA and WHIP are inverted (lower is better).
     """
-    avg_AB = statistics.mean(p["AB"] for p in pool)
-    avg_H  = statistics.mean(p["H"]  for p in pool)
-
-    baseline_team_avg = (avg_H * ROSTER_SPOTS) / (avg_AB * ROSTER_SPOTS)
-
-    deltas = []
-    for p in pool:
-        team_avg_with = (avg_H * ROSTER_SPOTS + p["H"]) / (avg_AB * ROSTER_SPOTS + p["AB"])
-        deltas.append(team_avg_with - baseline_team_avg)
-
-    delta_std = statistics.stdev(deltas) if len(deltas) > 1 else 1.0
-
-    player_delta = (avg_H * ROSTER_SPOTS + player["H"]) / (avg_AB * ROSTER_SPOTS + player["AB"]) - baseline_team_avg
-
-    return player_delta / delta_std if delta_std != 0 else 0.0
-
-# ── Helper: compute FVARz for all players ───────────────
-def _compute_all_fvarz(pool: list[dict]) -> dict[str, float]:
-    """
-    Returns {player_name: fvarz} for all players in pool.
-
-    FVARz = sum(z_R, z_HR, z_RBI, z_SB, z_AVG) - replacement_z
-    replacement_z = raw z-score sum of the REPLACEMENT_N-th best player
-    """
-    stats = {}
-    for cat in ["R", "HR", "RBI", "SB"]:
-        values = [p[cat] for p in pool]
-        stats[cat] = {
-            "mean": statistics.mean(values),
-            "std":  statistics.stdev(values) if len(values) > 1 else 1.0
-        }
-
-    raw_scores = {}
-    for p in pool:
-        z = (
-            _zscore(p["R"],   stats["R"]["mean"],   stats["R"]["std"])
-            + _zscore(p["HR"],  stats["HR"]["mean"],  stats["HR"]["std"])
-            + _zscore(p["RBI"], stats["RBI"]["mean"], stats["RBI"]["std"])
-            + _zscore(p["SB"],  stats["SB"]["mean"],  stats["SB"]["std"])
-            + _avg_zscore(p, pool)
+    if player_type == "batter":
+        b = BATTER_BASELINES
+        z_total = (
+            _zscore(stats.R,   b["R"]["mean"],   b["R"]["std"])
+            + _zscore(stats.HR,  b["HR"]["mean"],  b["HR"]["std"])
+            + _zscore(stats.RBI, b["RBI"]["mean"], b["RBI"]["std"])
+            + _zscore(stats.SB,  b["SB"]["mean"],  b["SB"]["std"])
+            + _zscore(stats.AVG, b["AVG"]["mean"], b["AVG"]["std"])
         )
-        raw_scores[p["Player"]] = z
-
-    sorted_scores = sorted(raw_scores.values(), reverse=True)
-    replacement_z = sorted_scores[REPLACEMENT_N - 1] if len(sorted_scores) >= REPLACEMENT_N else sorted_scores[-1]
-
-    fvarz = {name: score - replacement_z for name, score in raw_scores.items()}
-    return fvarz
-
-# ── Helper: convert FVARz to auction dollars ────────────
-def _fvarz_to_dollar(fvarz: float, all_fvarz: dict[str, float]) -> int:
-    """
-    total_budget = NUM_TEAMS x BUDGET_PER_TEAM x HITTER_SPLIT
-    player_value = (fvarz / sum_of_positive_fvarz) x total_budget
-    Minimum value: $1
-    """
-    total_budget = NUM_TEAMS * BUDGET_PER_TEAM * HITTER_SPLIT
-    sum_positive = sum(v for v in all_fvarz.values() if v > 0)
-
-    if sum_positive == 0 or fvarz <= 0:
-        return 1
-
-    dollar = (fvarz / sum_positive) * total_budget
-    return max(1, round(dollar))
-
-# ── Core function 1: player_value ───────────────────────
-def get_player_value(player_name: str) -> PlayerValueResponse:
-    pool = _get_pool()
-
-    player = next(
-        (p for p in pool if p["Player"].lower() == player_name.lower()),
-        None
-    )
-    if player is None:
-        raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
-
-    all_fvarz = _compute_all_fvarz(pool)
-    player_fvarz = all_fvarz.get(player["Player"], 0.0)
-    value = _fvarz_to_dollar(player_fvarz, all_fvarz)
-
-    return PlayerValueResponse(player_name=player["Player"], player_value=value)
-
-# ── Core function 2: recommended_bid ────────────────────
-def get_recommended_bid(player_name: str, draft_state: PlayerBidRequest) -> PlayerBidResponse:
-    # Base value from player_value calculation
-    base = get_player_value(player_name).player_value
-
-    # ── Factor 1: Position need ──
-    # Full position matching deferred until player position data is added
-    need_factor = 1.0
-    all_opponents_have = all(
-        player_name.lower() in [p.lower() for p in opp.positions_filled]
-        for opp in draft_state.opponents
-    )
-    if all_opponents_have:
-        need_factor = 0.80  # No competition — all opponents already filled this
-
-    # ── Factor 2: Draft stage discount ──
-    budget_ratio = draft_state.my_budget_remaining / BUDGET_PER_TEAM
-    if budget_ratio < 0.30:
-        stage_discount = 0.80   # End game
-    elif budget_ratio < 0.60:
-        stage_discount = 0.90   # Mid draft
     else:
-        stage_discount = 1.00   # Early
+        p = PITCHER_BASELINES
+        # ERA and WHIP: negate z-score so that lower value = higher z
+        z_total = (
+            _zscore(stats.W,    p["W"]["mean"],    p["W"]["std"])
+            + _zscore(stats.SV,   p["SV"]["mean"],   p["SV"]["std"])
+            + _zscore(stats.K,    p["K"]["mean"],    p["K"]["std"])
+            - _zscore(stats.ERA,  p["ERA"]["mean"],  p["ERA"]["std"])
+            - _zscore(stats.WHIP, p["WHIP"]["mean"], p["WHIP"]["std"])
+        )
+    return z_total
 
-    # ── Factor 3: Budget ceiling ──
-    max_safe_bid = draft_state.my_budget_remaining - len(draft_state.my_roster_empty)
 
-    adjusted = base * need_factor * stage_discount
-    recommended = max(1, min(round(adjusted), max_safe_bid))
+def _get_position_bonus(position: str) -> float:
+    """Return positional scarcity bonus in z-score units."""
+    return POSITION_BONUS.get(position.upper(), 0.0)
 
-    return PlayerBidResponse(player_name=player_name, recommended_bid=recommended)
+
+def _get_risk_penalty(stats: BatterStats | PitcherStats, player_type: str) -> float:
+    """
+    Compute total risk penalty in z-score units.
+    Multiple conditions can apply simultaneously.
+    """
+    penalty = 0.0
+
+    if player_type == "batter":
+        # Insufficient playing time
+        if stats.AB < 300:
+            penalty += 0.5
+        # Poor stolen base efficiency
+        total_attempts = stats.SB + stats.CS
+        if total_attempts > 0 and (stats.CS / total_attempts) > 0.35:
+            penalty += 0.2
+
+    else:
+        # Insufficient innings pitched (starting pitcher threshold)
+        if stats.IP < 100:
+            penalty += 0.5
+        # High ERA hurts roto standings significantly
+        if stats.ERA > 4.50:
+            penalty += 0.3
+
+    return penalty
+
+
+# ── Core Function 1: player_value ────────────────────────────────────────────
+
+def compute_player_value(request: PlayerValueRequest) -> PlayerValueResponse:
+    """
+    Compute player_value (0.0 ~ 100.0) using Roto 5x5 z-score method.
+
+    Pipeline:
+      1. z_total      = sum of z-scores for 5 roto categories
+      2. raw_score    = z_total + position_bonus - risk_penalty
+      3. stat_score   = normalize(z_total, Z_MAX)
+      4. player_value = normalize(raw_score, RAW_MAX)
+    """
+    z_max = Z_MAX_BATTER if request.player_type == "batter" else Z_MAX_PITCHER
+
+    z_total         = _compute_z_scores(request.stats, request.player_type)
+    position_bonus  = _get_position_bonus(request.position)
+    risk_penalty    = _get_risk_penalty(request.stats, request.player_type)
+
+    raw_score    = z_total + position_bonus - risk_penalty
+    stat_score   = _normalize(z_total,   z_max)
+    player_value = _normalize(raw_score, RAW_MAX)
+
+    # Scale bonus and penalty to 0~100 for readable breakdown
+    bonus_scaled   = _normalize(position_bonus, RAW_MAX)
+    penalty_scaled = _normalize(risk_penalty,   RAW_MAX)
+
+    return PlayerValueResponse(
+        player_name=request.player_name,
+        player_type=request.player_type,
+        player_value=round(player_value, 1),
+        value_breakdown=ValueBreakdown(
+            stat_score=round(stat_score,     1),
+            position_bonus=round(bonus_scaled,   1),
+            risk_penalty=round(penalty_scaled,   1),
+        ),
+    )
+
+
+# ── Core Function 2: recommended_bid ─────────────────────────────────────────
+
+def compute_recommended_bid(request: PlayerBidRequest) -> PlayerBidResponse:
+    """
+    Compute recommended_bid (integer dollar amount) using player_value
+    adjusted for positional scarcity and real-time draft context.
+
+    Pipeline:
+      1. base_price       = (player_value / 100) * total_budget * HIT_PITCH_RATIO
+      2. adjusted_price   = base_price * scarcity_multiplier
+      3. spendable        = my_remaining_budget - (my_remaining_roster_spots - 1)
+      4. draft_adjustment = 1.0 + (budget_ratio - 0.5) * 0.2 * draft_progress
+      5. recommended_bid  = clip(round(adjusted_price * draft_adjustment), 1, spendable)
+    """
+    # Reuse player_value computation
+    value_response = compute_player_value(
+        PlayerValueRequest(
+            player_name=request.player_name,
+            player_type=request.player_type,
+            position=request.position,
+            stats=request.stats,
+            league_context=request.league_context,
+        )
+    )
+    player_value = value_response.player_value
+
+    lc = request.league_context
+    dc = request.draft_context
+    pos = request.position.upper()
+
+    # Step 1: base price
+    ratio      = HIT_PITCH_RATIO.get(request.player_type, 0.5)
+    base_price = (player_value / 100.0) * lc.total_budget * ratio
+
+    # Step 2: scarcity multiplier
+    multiplier     = SCARCITY_MULTIPLIER.get(pos, 1.0)
+    adjusted_price = base_price * multiplier
+    scarcity_adj   = adjusted_price - base_price
+
+    # Step 3: budget ceiling
+    min_reserve = dc.my_remaining_roster_spots - 1
+    spendable   = max(1, dc.my_remaining_budget - min_reserve)
+
+    # Step 4: draft progress adjustment
+    total_players  = lc.league_size * lc.roster_size
+    draft_progress = dc.drafted_players_count / total_players if total_players > 0 else 0.0
+    budget_ratio   = spendable / dc.my_remaining_budget if dc.my_remaining_budget > 0 else 0.5
+
+    draft_multiplier = 1.0 + (budget_ratio - 0.5) * 0.2 * draft_progress
+    draft_adj        = adjusted_price * draft_multiplier - adjusted_price
+
+    # Step 5: final bid
+    raw_bid         = adjusted_price * draft_multiplier
+    recommended_bid = max(1, min(round(raw_bid), spendable))
+
+    return PlayerBidResponse(
+        player_name=request.player_name,
+        player_type=request.player_type,
+        player_value=player_value,
+        recommended_bid=recommended_bid,
+        bid_breakdown=BidBreakdown(
+            base_price=round(base_price,   2),
+            scarcity_adjustment=round(scarcity_adj, 2),
+            draft_adjustment=round(draft_adj,    2),
+            max_spendable=spendable,
+        ),
+    )
